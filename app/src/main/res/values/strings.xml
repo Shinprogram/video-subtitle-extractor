@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SubExtract</string>
+    <string name="extracting_subtitles">Extracting subtitles</string>
+    <string name="extracting_progress_template">%1$d of %2$d frames</string>
+</resources>

@@ -1,0 +1,21 @@
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+*.apk
+*.aab
+*.hprof
+/app/build
+/app/release
+/app/debug
+# Keep OCR models, assets
+!/app/src/main/assets/**
+!/app/libs/**
+# don't commit downloaded Paddle Lite AARs — use setup script
+/app/libs/paddle_lite/

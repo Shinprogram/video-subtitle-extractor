@@ -1,0 +1,5 @@
+## Copy to `local.properties` and fill in:
+sdk.dir=/path/to/your/Android/sdk
+## Optional — the Gemini API key used for online translation. Leave blank
+## to enter it at runtime on the in-app Settings screen instead.
+GEMINI_API_KEY=
