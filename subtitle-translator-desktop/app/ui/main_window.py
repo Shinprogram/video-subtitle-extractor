@@ -16,7 +16,6 @@ Layout:
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -48,9 +47,11 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from ..config import AppConfig
 from ..gemini_api import GeminiTranslator
 from ..subtitle_parser import SubtitleDocument, SubtitleEntry, format_ms
 from ..video_player import VideoPlayer
+from .settings_dialog import SettingsDialog
 from .styles import DARK_QSS
 from .workers import BatchTranslateWorker, TranslateWorker
 
@@ -104,19 +105,35 @@ class VideoFrame(QFrame):
         self.overlay.setAttribute(Qt.WA_TranslucentBackground, True)
         self.overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.overlay.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        # Default overlay style; re-applied with user-chosen font/size
+        # via :meth:`apply_overlay_font` when settings change.
+        self._overlay_font_family = "Sans Serif"
+        self._overlay_font_size_px = 20
+        self._apply_overlay_stylesheet()
+        self.overlay.hide()
+
+    def _apply_overlay_stylesheet(self) -> None:
         # Top-level widgets don't inherit the main window's stylesheet,
         # so style the overlay directly.
         self.overlay.setStyleSheet(
             "QLabel {"
-            " color: #FFFFFF;"
-            " background-color: rgba(0, 0, 0, 180);"
-            " border-radius: 6px;"
-            " padding: 6px 14px;"
-            " font-size: 18px;"
-            " font-weight: 500;"
+            f" color: #FFFFFF;"
+            f" background-color: rgba(0, 0, 0, 180);"
+            f" border-radius: 6px;"
+            f" padding: 6px 14px;"
+            f" font-family: \"{self._overlay_font_family}\";"
+            f" font-size: {self._overlay_font_size_px}px;"
+            f" font-weight: 500;"
             "}"
         )
-        self.overlay.hide()
+
+    def apply_overlay_font(self, family: str, size_px: int) -> None:
+        self._overlay_font_family = family or "Sans Serif"
+        self._overlay_font_size_px = max(8, min(72, int(size_px)))
+        self._apply_overlay_stylesheet()
+        # Recompute geometry so the new font size gets the right width.
+        self.overlay.adjustSize()
+        self._reposition_overlay()
 
     def set_subtitle(self, text: str) -> None:
         text = (text or "").strip()
@@ -143,8 +160,13 @@ class VideoFrame(QFrame):
 
     def hideEvent(self, event) -> None:  # noqa: N802 - Qt override
         # Keep the overlay from floating over other apps when this frame
-        # is hidden (e.g. app minimised).
-        self.overlay.hide()
+        # is hidden (e.g. app minimised). The overlay is a separate
+        # top-level QLabel — it may already have been closed/deleted
+        # during shutdown, so tolerate that race.
+        try:
+            self.overlay.hide()
+        except RuntimeError:
+            pass
         super().hideEvent(event)
 
     def _reposition_overlay(self) -> None:
@@ -253,6 +275,13 @@ class MainWindow(QMainWindow):
         # we accumulate and show a single summary in ``_on_batch_done``.
         self._batch_fail_count: int = 0
         self._batch_first_error: Optional[str] = None
+        # Set to True when the app minimises; we use it to gate the
+        # sync tick so no overlay / status updates fire while hidden.
+        self._minimised = False
+        self._was_playing_before_minimise = False
+
+        # --- Persistent user config ---
+        self.config = AppConfig.load()
 
         # --- Video engine ---
         try:
@@ -261,7 +290,10 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "VLC not available", str(e))
             raise
 
-        self.translator = GeminiTranslator()
+        # Translator holds a reference to the live config so changes
+        # made via the Settings dialog (API key, prompt, language) take
+        # effect immediately without reconstructing the worker.
+        self.translator = GeminiTranslator(self.config)
 
         # --- Widgets ---
         self._build_toolbar()
@@ -271,6 +303,11 @@ class MainWindow(QMainWindow):
 
         # Attach libvlc output *after* the window is shown so winId() is valid.
         QTimer.singleShot(0, self._attach_player)
+
+        # Apply persisted font settings to the overlay once widgets exist.
+        self.video_frame.apply_overlay_font(
+            self.config.font_family, self.config.font_size_px
+        )
 
         # Sync timer: drives subtitle overlay + seek bar.
         self._sync_timer = QTimer(self)
@@ -315,6 +352,15 @@ class MainWindow(QMainWindow):
         self.delay_spin.setToolTip("Shift all subtitles (positive = later).")
         self.delay_spin.valueChanged.connect(self._on_delay_changed)
         tb.addWidget(self.delay_spin)
+
+        # Spacer pushes Settings to the far right of the toolbar.
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        tb.addWidget(spacer)
+
+        self.settings_btn = QPushButton("Settings…")
+        self.settings_btn.clicked.connect(self.open_settings)
+        tb.addWidget(self.settings_btn)
 
     def _build_central(self) -> None:
         root = QWidget()
@@ -546,6 +592,11 @@ class MainWindow(QMainWindow):
         self.toggle_play()
 
     def _on_tick(self) -> None:
+        # Defensive: if the timer somehow fires while minimised (race
+        # between ``stop()`` and a queued timeout), do nothing. The
+        # overlay is hidden and we don't want to re-show it.
+        if self._minimised:
+            return
         pos = self.player.position_ms()
         dur = self.player.duration_ms()
 
@@ -754,14 +805,17 @@ class MainWindow(QMainWindow):
             self.batch_btn.setText("Translate All")
             self._set_status("Batch translation cancelled")
             return
-        if not os.environ.get("GEMINI_API_KEY"):
+        if not self.config.resolved_api_key():
             QMessageBox.warning(
                 self,
                 "Missing API key",
-                "GEMINI_API_KEY environment variable is not set.",
+                "Gemini API key is not configured.\n\n"
+                "Open Settings… to paste your key, or export "
+                "GEMINI_API_KEY in your environment.",
             )
             return
 
+        # Skip empty cues up front so the API never receives them.
         items: List[Tuple[int, str]] = [
             (e.index, e.text) for e in self.document.entries if e.text.strip()
         ]
@@ -771,12 +825,22 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.progress.setVisible(True)
         self.batch_btn.setText("Cancel")
-        self._set_status(f"Batch translating {len(items)} subtitles…")
+        self._set_status(
+            f"Batch translating {len(items)} subtitles "
+            f"(batch size {self.config.batch_size}, "
+            f"delay {self.config.request_delay_ms} ms)…"
+        )
         # Reset the per-batch failure tally before starting.
         self._batch_fail_count = 0
         self._batch_first_error = None
 
-        worker = BatchTranslateWorker(self.translator, items, self)
+        worker = BatchTranslateWorker(
+            self.translator,
+            items,
+            batch_size=self.config.batch_size,
+            request_delay_ms=self.config.request_delay_ms,
+            parent=self,
+        )
         worker.progress.connect(self._on_batch_progress)
         # Route batch failures to a non-modal aggregator; ``_on_translate_fail``
         # (used for single-cue translations) pops a dialog per failure and
@@ -850,6 +914,77 @@ class MainWindow(QMainWindow):
 
     def _set_status(self, text: str) -> None:
         self.status_msg.setText(text)
+
+    # ---------------------------------------------------------------
+    # Settings
+    # ---------------------------------------------------------------
+    def open_settings(self) -> None:
+        dlg = SettingsDialog(self.config, self)
+        if dlg.exec_() != SettingsDialog.Accepted:
+            return
+        try:
+            saved_at = self.config.save()
+            self._set_status(f"Settings saved to {saved_at}")
+        except OSError as e:
+            QMessageBox.warning(
+                self,
+                "Could not save settings",
+                f"Failed to write config file:\n{e}",
+            )
+        # Apply any runtime-visible changes immediately.
+        self.video_frame.apply_overlay_font(
+            self.config.font_family, self.config.font_size_px
+        )
+
+    # ---------------------------------------------------------------
+    # Window-state transitions (minimise / restore)
+    # ---------------------------------------------------------------
+    def changeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        # ``WindowStateChange`` fires when the window is minimised,
+        # restored, maximised, etc. We only treat minimise specially:
+        # hide the top-level overlay so it can't float over other apps
+        # as a ghost, pause playback, and stop the sync timer so no
+        # background signals fire on an invisible UI.
+        from PyQt5.QtCore import QEvent  # local import keeps Qt out of module scope
+        if event.type() == QEvent.WindowStateChange:
+            is_min = bool(self.windowState() & Qt.WindowMinimized)
+            if is_min and not self._minimised:
+                self._enter_minimised()
+            elif not is_min and self._minimised:
+                self._exit_minimised()
+        super().changeEvent(event)
+
+    def _enter_minimised(self) -> None:
+        self._minimised = True
+        # Stop the subtitle/seek tick so we don't pointlessly repaint.
+        if self._sync_timer.isActive():
+            self._sync_timer.stop()
+        # Hide overlay immediately — it's its own top-level window
+        # and would otherwise linger on-screen after minimise.
+        self.video_frame.overlay.hide()
+        # Pause playback and remember prior state so we can resume it
+        # on restore.
+        try:
+            self._was_playing_before_minimise = self.player.is_playing()
+            if self._was_playing_before_minimise:
+                self.player.pause()
+                self.play_btn.setText("Play")
+        except Exception:
+            self._was_playing_before_minimise = False
+
+    def _exit_minimised(self) -> None:
+        self._minimised = False
+        # Resume tick before anything else so the overlay / seek bar
+        # catch up on the next interval.
+        if not self._sync_timer.isActive():
+            self._sync_timer.start()
+        if self._was_playing_before_minimise:
+            try:
+                self.player.play()
+                self.play_btn.setText("Pause")
+            except Exception:
+                pass
+        self._was_playing_before_minimise = False
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
         try:
