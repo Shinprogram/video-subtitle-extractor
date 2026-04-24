@@ -198,6 +198,13 @@ class MainWindow(QMainWindow):
         self._last_delay_ms: int = 0
         self._active_workers: List[TranslateWorker] = []
         self._batch_worker: Optional[BatchTranslateWorker] = None
+        # Per-batch failure tally. We deliberately do NOT pop a modal
+        # dialog per failure here — with a bad API key that would flood
+        # the UI with one blocking ``QMessageBox`` per cue, locking the
+        # Cancel button behind a queue of nested event loops. Instead
+        # we accumulate and show a single summary in ``_on_batch_done``.
+        self._batch_fail_count: int = 0
+        self._batch_first_error: Optional[str] = None
 
         # --- Video engine ---
         try:
@@ -712,10 +719,16 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(True)
         self.batch_btn.setText("Cancel")
         self._set_status(f"Batch translating {len(items)} subtitles…")
+        # Reset the per-batch failure tally before starting.
+        self._batch_fail_count = 0
+        self._batch_first_error = None
 
         worker = BatchTranslateWorker(self.translator, items, self)
         worker.progress.connect(self._on_batch_progress)
-        worker.failed.connect(self._on_translate_fail)
+        # Route batch failures to a non-modal aggregator; ``_on_translate_fail``
+        # (used for single-cue translations) pops a dialog per failure and
+        # would flood the UI here.
+        worker.failed.connect(self._on_batch_translate_fail)
         worker.finished_all.connect(self._on_batch_done)
         self._batch_worker = worker
         worker.start()
@@ -732,11 +745,40 @@ class MainWindow(QMainWindow):
         self.progress.setValue(done)
         self._set_status(f"Translated {done}/{total}")
 
+    def _on_batch_translate_fail(self, entry_index: int, msg: str) -> None:
+        """Silently tally batch failures; summary is shown in ``_on_batch_done``.
+
+        We deliberately do NOT show a modal dialog here — during a broken
+        run (e.g. invalid API key) every item fails, and popping one modal
+        per cue would block the user from even reaching the Cancel button.
+        """
+        self._batch_fail_count += 1
+        if self._batch_first_error is None:
+            self._batch_first_error = msg
+        self._set_status(
+            f"Batch translation: {self._batch_fail_count} failure(s) so far"
+        )
+
     def _on_batch_done(self) -> None:
         self.progress.setVisible(False)
         self.batch_btn.setText("Translate All")
         self._batch_worker = None
-        self._set_status("Batch translation finished")
+        if self._batch_fail_count:
+            sample = self._batch_first_error or ""
+            self._set_status(
+                f"Batch translation finished with {self._batch_fail_count} failure(s)"
+            )
+            QMessageBox.warning(
+                self,
+                "Batch translation finished with errors",
+                f"{self._batch_fail_count} subtitle(s) failed to translate.\n\n"
+                f"First error:\n{sample}",
+            )
+        else:
+            self._set_status("Batch translation finished")
+        # Clear the tally regardless so the next batch starts fresh.
+        self._batch_fail_count = 0
+        self._batch_first_error = None
 
     # ---------------------------------------------------------------
     # Misc

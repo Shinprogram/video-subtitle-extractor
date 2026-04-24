@@ -77,4 +77,9 @@ class BatchTranslateWorker(QThread):
                 self.failed.emit(entry_index, str(e))
             except Exception as e:  # pragma: no cover
                 self.failed.emit(entry_index, f"Unexpected: {e}")
-        self.finished_all.emit()
+        # Don't signal completion if we were cancelled — the caller has
+        # already torn down the worker in its cancel branch, and a late
+        # ``finished_all`` could otherwise null out a subsequently-started
+        # batch worker via ``_on_batch_done``.
+        if not self._cancel:
+            self.finished_all.emit()
