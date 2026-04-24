@@ -168,14 +168,20 @@ class SubtitleDocument:
         return cls(entries=entries)
 
     def to_srt(self, use_translated: bool = True) -> str:
+        # Each cue ends with ``\n\n`` — the final ``\n`` terminates the
+        # body line (or acts as an empty body line when the user has
+        # cleared the cue) and the second ``\n`` is the mandatory blank
+        # separator required by the SubRip spec. We deliberately do NOT
+        # ``.strip()`` the joined result: with a cleared last cue the
+        # strip would eat the separator that keeps strict parsers happy.
         parts: List[str] = []
         for i, e in enumerate(self.entries, start=1):
             text = e.display_text if use_translated else e.text
             parts.append(
                 f"{i}\n{_ms_to_timecode(e.start_ms)} --> "
-                f"{_ms_to_timecode(e.end_ms)}\n{text}\n"
+                f"{_ms_to_timecode(e.end_ms)}\n{text}\n\n"
             )
-        return "\n".join(parts).strip() + "\n"
+        return "".join(parts)
 
     def save(self, path: str | Path, use_translated: bool = True) -> None:
         Path(path).write_text(self.to_srt(use_translated), encoding="utf-8")

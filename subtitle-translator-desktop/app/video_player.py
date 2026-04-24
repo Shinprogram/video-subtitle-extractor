@@ -61,7 +61,30 @@ class VideoPlayer:
         self._player.set_media(media)
         self._loaded = path
 
+    def _is_ended(self) -> bool:
+        """True when the current media has reached EOF.
+
+        Once libvlc reaches ``State.Ended`` it ignores ``play()`` and
+        ``set_time()`` until a fresh ``set_media`` is installed, which
+        is why naively clicking Play after EOF does nothing.
+        """
+        try:
+            return self._player.get_state() == vlc.State.Ended
+        except Exception:
+            return False
+
+    def _rewind_if_ended(self) -> None:
+        """Re-arm the player so it can play again after reaching EOF."""
+        if not self._is_ended() or self._loaded is None:
+            return
+        # Stopping first clears the Ended state; re-setting the same
+        # media gives libvlc a fresh playback cursor at 0.
+        self._player.stop()
+        media = self._instance.media_new(self._loaded)
+        self._player.set_media(media)
+
     def play(self) -> None:
+        self._rewind_if_ended()
         self._player.play()
 
     def pause(self) -> None:
@@ -98,6 +121,9 @@ class VideoPlayer:
         return max(0, int(d))
 
     def seek_ms(self, ms: int) -> None:
+        # If the media ended, re-arm it first so ``set_time`` actually
+        # lands somewhere instead of being silently dropped.
+        self._rewind_if_ended()
         self._player.set_time(max(0, int(ms)))
 
     def is_playing(self) -> bool:

@@ -20,7 +20,7 @@ import os
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import QPoint, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import (
     QAbstractItemView,
@@ -62,8 +62,16 @@ SYNC_INTERVAL_MS = 100
 class VideoFrame(QFrame):
     """Black frame that hosts the libvlc output + a subtitle overlay.
 
-    Using a subclass keeps ``winId()`` stable and lets us anchor the
-    overlay label to the bottom-centre via a manual layout on resize.
+    The overlay is **not** a child of this frame. On Linux/X11 libvlc
+    draws into this widget's native X window with a separate output
+    thread, so any QWidget children of ``VideoFrame`` end up silently
+    clipped or redrawn under the libvlc surface.
+
+    To dodge that we keep the overlay as a **frameless top-level
+    tool window** and reposition it ourselves (anchored to the bottom-
+    centre of this frame in screen coordinates). This makes the overlay
+    an independent X window that sits above libvlc's output in the
+    stacking order, which is exactly what we need.
     """
 
     double_clicked = pyqtSignal()
@@ -80,11 +88,34 @@ class VideoFrame(QFrame):
         self.setMinimumHeight(260)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-        self.overlay = QLabel("", self)
+        # Top-level frameless overlay — parent=None so it is its own
+        # native window and thus stacks above libvlc's video output.
+        self.overlay = QLabel(None)
         self.overlay.setObjectName("SubtitleOverlay")
         self.overlay.setAlignment(Qt.AlignCenter)
         self.overlay.setWordWrap(True)
-        self.overlay.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.overlay.setWindowFlags(
+            Qt.FramelessWindowHint
+            | Qt.Tool
+            | Qt.WindowStaysOnTopHint
+            | Qt.WindowTransparentForInput
+            | Qt.NoDropShadowWindowHint
+        )
+        self.overlay.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.overlay.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        # Top-level widgets don't inherit the main window's stylesheet,
+        # so style the overlay directly.
+        self.overlay.setStyleSheet(
+            "QLabel {"
+            " color: #FFFFFF;"
+            " background-color: rgba(0, 0, 0, 180);"
+            " border-radius: 6px;"
+            " padding: 6px 14px;"
+            " font-size: 18px;"
+            " font-weight: 500;"
+            "}"
+        )
         self.overlay.hide()
 
     def set_subtitle(self, text: str) -> None:
@@ -98,21 +129,38 @@ class VideoFrame(QFrame):
             lines = [lines[0], " ".join(lines[1:])]
         self.overlay.setText("\n".join(lines))
         self._reposition_overlay()
-        self.overlay.show()
+        if not self.overlay.isVisible():
+            self.overlay.show()
         self.overlay.raise_()
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
         super().resizeEvent(event)
         self._reposition_overlay()
 
+    def moveEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().moveEvent(event)
+        self._reposition_overlay()
+
+    def hideEvent(self, event) -> None:  # noqa: N802 - Qt override
+        # Keep the overlay from floating over other apps when this frame
+        # is hidden (e.g. app minimised).
+        self.overlay.hide()
+        super().hideEvent(event)
+
     def _reposition_overlay(self) -> None:
-        if not self.overlay.isVisible() and not self.overlay.text():
+        if not self.overlay.text():
+            return
+        # Compute the anchor in global screen coordinates so the overlay
+        # follows the frame through window drags, splitter resizes, and
+        # maximise/restore.
+        if not self.isVisible():
             return
         max_width = max(200, int(self.width() * 0.85))
         self.overlay.setMaximumWidth(max_width)
         self.overlay.adjustSize()
-        x = (self.width() - self.overlay.width()) // 2
-        y = self.height() - self.overlay.height() - 24
+        top_left = self.mapToGlobal(QPoint(0, 0))
+        x = top_left.x() + (self.width() - self.overlay.width()) // 2
+        y = top_left.y() + self.height() - self.overlay.height() - 24
         self.overlay.move(max(0, x), max(0, y))
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
@@ -512,6 +560,11 @@ class MainWindow(QMainWindow):
         # Subtitle overlay + list auto-scroll.
         entry = self.document.entry_at(pos)
         self.video_frame.set_subtitle(entry.display_text if entry else "")
+        # Re-anchor each tick so the top-level overlay tracks window
+        # drags, splitter resizes, and maximise/restore transitions —
+        # Qt doesn't deliver moveEvent to child widgets when the
+        # top-level window moves, so we reposition unconditionally.
+        self.video_frame._reposition_overlay()
         if entry is not None:
             row = entry.index - 1
             if row != self.current_row:
@@ -800,6 +853,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
         try:
+            # Top-level overlay is its own window — close it explicitly
+            # or it will linger as an orphaned native window.
+            self.video_frame.overlay.close()
             if self._batch_worker is not None:
                 self._batch_worker.cancel()
                 self._batch_worker.wait(1500)
