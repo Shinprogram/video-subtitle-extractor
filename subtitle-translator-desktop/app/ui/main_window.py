@@ -195,6 +195,7 @@ class MainWindow(QMainWindow):
         # --- State ---
         self.document = SubtitleDocument()
         self.current_row: int = -1
+        self._last_delay_ms: int = 0
         self._active_workers: List[TranslateWorker] = []
         self._batch_worker: Optional[BatchTranslateWorker] = None
 
@@ -431,10 +432,25 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            self.document = SubtitleDocument.from_file(path)
+            new_doc = SubtitleDocument.from_file(path)
         except Exception as e:
             QMessageBox.warning(self, "Subtitle error", str(e))
             return
+
+        # Cancel any in-flight translation work so stale entry indices from
+        # the previous document don't bleed into the new one.
+        self._cancel_all_translation_work()
+
+        self.document = new_doc
+        self.current_row = -1
+
+        # Reset the delay spinner so the delta-based delay logic starts
+        # from zero for the freshly-loaded document.
+        self._last_delay_ms = 0
+        self.delay_spin.blockSignals(True)
+        self.delay_spin.setValue(0)
+        self.delay_spin.blockSignals(False)
+
         self.table.load(self.document.entries)
         self._set_status(
             f"Loaded {len(self.document)} subtitles from {Path(path).name}"
@@ -585,6 +601,42 @@ class MainWindow(QMainWindow):
     def _prune_workers(self) -> None:
         self._active_workers = [w for w in self._active_workers if w.isRunning()]
 
+    def _cancel_all_translation_work(self) -> None:
+        """Stop any in-flight single/batch translations.
+
+        Called when swapping documents so stale ``entry_index`` values from
+        the previous document cannot leak into the new one via signals.
+        """
+        if self._batch_worker is not None and self._batch_worker.isRunning():
+            self._batch_worker.cancel()
+            # Short, bounded wait; the worker only polls ``_cancel`` between
+            # HTTP calls so we can't guarantee instant termination.
+            self._batch_worker.wait(1500)
+        # Disconnect stale signals regardless of whether the worker stopped.
+        if self._batch_worker is not None:
+            try:
+                self._batch_worker.progress.disconnect()
+                self._batch_worker.failed.disconnect()
+                self._batch_worker.finished_all.disconnect()
+            except TypeError:
+                pass
+        self._batch_worker = None
+
+        for w in self._active_workers:
+            try:
+                w.finished_ok.disconnect()
+                w.failed.disconnect()
+            except TypeError:
+                pass
+            if w.isRunning():
+                w.wait(500)
+        self._active_workers.clear()
+
+        # Restore UI affordances to their idle state.
+        self.progress.setVisible(False)
+        self.batch_btn.setText("Translate All")
+        self.translate_btn.setEnabled(True)
+
     def translate_current(self) -> None:
         if self.current_row < 0:
             return
@@ -680,8 +732,7 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------------
     def _on_delay_changed(self, value_ms: int) -> None:
         # We diff against the last applied delay so repeated edits remain sane.
-        last = getattr(self, "_last_delay_ms", 0)
-        delta = value_ms - last
+        delta = value_ms - self._last_delay_ms
         if delta == 0:
             return
         self.document.shift_all(delta)
