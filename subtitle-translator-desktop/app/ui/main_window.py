@@ -679,9 +679,20 @@ class MainWindow(QMainWindow):
         if not self.document.entries:
             return
         if self._batch_worker is not None and self._batch_worker.isRunning():
-            # Cancel ongoing batch instead of starting a new one.
+            # Cancel the ongoing batch and sever its signal connections so
+            # a late-arriving `finished_all` from the cancelled worker
+            # can't null out a subsequently-started batch worker.
             self._batch_worker.cancel()
+            try:
+                self._batch_worker.progress.disconnect()
+                self._batch_worker.failed.disconnect()
+                self._batch_worker.finished_all.disconnect()
+            except TypeError:
+                pass
+            self._batch_worker = None
+            self.progress.setVisible(False)
             self.batch_btn.setText("Translate All")
+            self._set_status("Batch translation cancelled")
             return
         if not os.environ.get("GEMINI_API_KEY"):
             QMessageBox.warning(
@@ -731,15 +742,16 @@ class MainWindow(QMainWindow):
     # Misc
     # ---------------------------------------------------------------
     def _on_delay_changed(self, value_ms: int) -> None:
-        # We diff against the last applied delay so repeated edits remain sane.
-        delta = value_ms - self._last_delay_ms
-        if delta == 0:
+        # Absolute apply: each cue = original + value_ms. This is lossless
+        # across repeated negative-then-positive sweeps (no delta drift).
+        if not self.document.entries:
+            self._last_delay_ms = value_ms
             return
-        self.document.shift_all(delta)
+        self.document.apply_delay(value_ms)
         self._last_delay_ms = value_ms
         for row, e in enumerate(self.document.entries):
             self.table.update_row(row, e)
-        self._set_status(f"Shifted subtitles by {delta:+d} ms")
+        self._set_status(f"Delay set to {value_ms:+d} ms")
 
     def _set_status(self, text: str) -> None:
         self.status_msg.setText(text)

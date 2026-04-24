@@ -55,11 +55,27 @@ class SubtitleEntry:
     text: str = ""
     # Translated text kept separately so we can toggle/restore it.
     translated: Optional[str] = None
+    # Originals captured at parse time so delay shifts can be applied
+    # absolutely (from the originals) rather than accumulating deltas
+    # through `shift_all`'s max(0, ...) clamp.
+    original_start_ms: int = -1
+    original_end_ms: int = -1
+
+    def __post_init__(self) -> None:
+        if self.original_start_ms < 0:
+            self.original_start_ms = self.start_ms
+        if self.original_end_ms < 0:
+            self.original_end_ms = self.end_ms
 
     @property
     def display_text(self) -> str:
-        """Prefer the translated text when available."""
-        return self.translated if self.translated else self.text
+        """Prefer the translated text when a translation has been set.
+
+        ``translated`` is ``None`` when no override has been applied — we
+        must NOT use a truthy check here because an explicitly empty
+        string is a valid user edit (e.g. clearing the cue).
+        """
+        return self.translated if self.translated is not None else self.text
 
     @property
     def start_tc(self) -> str:
@@ -181,10 +197,30 @@ class SubtitleDocument:
         return None
 
     def shift_all(self, delta_ms: int) -> None:
-        """Adjust every cue by ``delta_ms`` milliseconds."""
+        """Adjust every cue (and its stored originals) by ``delta_ms``.
+
+        This mutates both the current *and* the original timestamps so
+        the shift is idempotent with :meth:`apply_delay`. Most callers
+        (the delay spinner) should prefer :meth:`apply_delay`, which is
+        absolute and therefore drift-free.
+        """
         for e in self.entries:
             e.start_ms = max(0, e.start_ms + delta_ms)
             e.end_ms = max(0, e.end_ms + delta_ms)
+            e.original_start_ms = max(0, e.original_start_ms + delta_ms)
+            e.original_end_ms = max(0, e.original_end_ms + delta_ms)
+
+    def apply_delay(self, delay_ms: int) -> None:
+        """Set each cue's time to ``original + delay_ms`` (clamped >= 0).
+
+        Because we compute against the captured originals rather than
+        the current values, repeatedly sweeping the delay through
+        negative values is lossless — even for cues near t=0 where a
+        naive delta-based approach would silently drift due to clamping.
+        """
+        for e in self.entries:
+            e.start_ms = max(0, e.original_start_ms + delay_ms)
+            e.end_ms = max(0, e.original_end_ms + delay_ms)
 
     def __len__(self) -> int:
         return len(self.entries)
