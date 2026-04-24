@@ -17,6 +17,21 @@ the **Gemini API**, and packaged as a Windows `.exe` via PyInstaller.
 - Inline editor with **Apply Changes** that updates the overlay instantly.
 - **Translate** a single cue or **Translate All** via Gemini (runs in a
   background thread so the UI stays snappy).
+- Numbered **batch translation** — groups cues into batches of 40 lines
+  (configurable) and sends one API request per batch, preserving strict
+  order.
+- Rate-limit protection: configurable delay between batches (default
+  1.5 s) and automatic retry up to 3 times with exponential backoff
+  (1 s → 2 s → 4 s) on HTTP 429 / 5xx / network errors.
+- **Settings dialog** (toolbar → Settings…) persists per-user to
+  `config.json`:
+  - Gemini API key (no need to export an env var)
+  - Custom translation prompt
+  - Target language
+  - Overlay font family + size
+  - Batch size and inter-batch delay
+- Subtitle overlay pauses and hides automatically when the window is
+  minimised — no ghost subtitles on top of other apps.
 - Subtitle delay adjustment (+/- seconds) to fix mis-synced subtitles.
 - Export edited / translated subtitles back to `.srt`.
 - Keyboard shortcuts:
@@ -30,12 +45,14 @@ the **Gemini API**, and packaged as a Windows `.exe` via PyInstaller.
 subtitle-translator-desktop/
 ├── main.py                  # App entrypoint
 ├── app/
+│   ├── config.py            # User config (JSON) — API key, prompt, font, rate limits
 │   ├── subtitle_parser.py   # SRT parsing / serialization
 │   ├── video_player.py      # Thin python-vlc wrapper
-│   ├── gemini_api.py        # Gemini REST client
+│   ├── gemini_api.py        # Gemini REST client (single + numbered-batch)
 │   └── ui/
 │       ├── main_window.py   # Main Qt window + layout
-│       ├── workers.py       # QThread workers for translation
+│       ├── settings_dialog.py  # Settings editor
+│       ├── workers.py       # QThread workers (batched + rate-limited)
 │       └── styles.py        # Dark-theme QSS stylesheet
 ├── requirements.txt
 ├── requirements-dev.txt
@@ -65,15 +82,27 @@ pip install -r requirements.txt
 
 ### 3. Set your Gemini API key
 
-Create a key at <https://aistudio.google.com/app/apikey>, then:
+Create a key at <https://aistudio.google.com/app/apikey>. You have two
+options:
 
-```bash
-# macOS / Linux
-export GEMINI_API_KEY="your-key-here"
+1. **Recommended** — launch the app, open **Settings…** from the
+   toolbar, paste the key into the *Gemini API key* field, and click
+   OK. The key is persisted to `config.json` under your user config
+   directory:
+   - Linux: `~/.config/subtitle-translator/config.json`
+   - macOS: `~/Library/Application Support/subtitle-translator/config.json`
+   - Windows: `%APPDATA%\subtitle-translator\config.json`
+2. **Fallback** — export `GEMINI_API_KEY` in your shell before launching:
 
-# Windows (PowerShell)
-$Env:GEMINI_API_KEY = "your-key-here"
-```
+   ```bash
+   # macOS / Linux
+   export GEMINI_API_KEY="your-key-here"
+
+   # Windows (PowerShell)
+   $Env:GEMINI_API_KEY = "your-key-here"
+   ```
+
+The Settings dialog value wins when both are set.
 
 ### 4. Run
 
@@ -92,8 +121,9 @@ The bundled app will be written to `dist/SubtitleTranslator/`. End users
 still need the **VLC runtime** installed; this keeps the bundle small and
 avoids redistributing VLC binaries.
 
-Launch the packaged app the same way as the source version — with
-`GEMINI_API_KEY` set in the environment.
+Launch the packaged app the same way as the source version. You can
+paste the Gemini API key via **Settings…** once, and it will persist
+across launches.
 
 ## Notes on architecture
 
@@ -103,8 +133,25 @@ Launch the packaged app the same way as the source version — with
 - **Translation calls** run in `QThread` workers (see `app/ui/workers.py`) so
   the UI thread never blocks. Individual translations and full-batch
   translations both report progress via Qt signals.
-- **Overlay rendering** is a plain `QLabel` child of the video frame,
-  repositioned on every resize. This works cross-platform without having to
-  poke at libvlc's native subtitle track.
+- **Batch translation** uses a numbered-line prompt: the model receives
+  `1. foo\n2. bar\n…` and must return the same count in the same order.
+  The parser in `gemini_api.parse_numbered_response` tolerates stray
+  model chrome (markdown fences, greetings) and guarantees a result
+  list of exactly `len(inputs)` — missing lines come back as empty
+  strings and are surfaced to the UI as per-cue failures so the user
+  can retry them individually.
+- **Rate limiting** is owned by the worker, not the API client, so the
+  sleep between batches is interruptible and cancellation is
+  responsive. The worker retries transient errors (HTTP 429 / 5xx /
+  network) up to 3 times with exponential backoff, but does NOT retry
+  permanent errors (bad API key, malformed response, safety block).
+- **Minimise handling** is symmetrical: on `WindowMinimized` the sync
+  timer stops, the top-level overlay hides, and playback pauses;
+  restoring reverses all three.
+- **Overlay rendering** is a frameless top-level `QLabel` anchored in
+  global screen coordinates over the video frame — this is required on
+  Linux/X11 because libvlc's video output repaints over any native
+  child widgets. The overlay is hidden while the window is minimised
+  so it can't float over other apps.
 - **Gemini client** talks directly to the REST API using `urllib` — no extra
   SDK needed, which keeps the PyInstaller bundle slim.
