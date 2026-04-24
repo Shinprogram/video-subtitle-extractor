@@ -29,7 +29,15 @@ class VideoPlayer:
                 "python-vlc is not installed; install VLC + `pip install python-vlc`."
             )
         # `--no-xlib` avoids the libvlc X11 lock on Linux; harmless on Windows.
-        args = ["--no-video-title-show", "--quiet"]
+        # `--no-sub-autodetect-file` stops libvlc from silently auto-loading
+        # any .srt it finds next to the video and rendering its own subtitle
+        # track; we want full control over the Qt overlay so user edits to
+        # `SubtitleEntry.translated` are what actually shows on screen.
+        args = [
+            "--no-video-title-show",
+            "--quiet",
+            "--no-sub-autodetect-file",
+        ]
         if sys.platform.startswith("linux"):
             args.append("--no-xlib")
         self._instance = vlc.Instance(*args)
